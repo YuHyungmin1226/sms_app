@@ -8,7 +8,6 @@ import android.net.Uri
 import android.os.Bundle
 import android.provider.ContactsContract
 import android.provider.Settings
-import android.provider.Telephony
 import android.telephony.SmsManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -252,9 +251,8 @@ class MainActivity : ComponentActivity() {
             return false
         }
 
-        val defaultSmsPackage = Telephony.Sms.getDefaultSmsPackage(this)
-        if (defaultSmsPackage != "com.google.android.apps.messaging") {
-            Toast.makeText(this, "기본 문자 앱을 Google 메시지로 설정해 주세요.", Toast.LENGTH_LONG).show()
+        if (!isGoogleMessagesInstalled()) {
+            Toast.makeText(this, "Google 메시지 앱이 설치되어 있지 않습니다.", Toast.LENGTH_LONG).show()
             return false
         }
 
@@ -271,6 +269,12 @@ class MainActivity : ComponentActivity() {
             Toast.makeText(this, "Google 메시지를 열 수 없습니다.", Toast.LENGTH_LONG).show()
         }
         return started
+    }
+
+    private fun isGoogleMessagesInstalled(): Boolean {
+        return runCatching {
+            packageManager.getApplicationInfo("com.google.android.apps.messaging", 0)
+        }.isSuccess
     }
 
     fun openAccessibilitySettings() {

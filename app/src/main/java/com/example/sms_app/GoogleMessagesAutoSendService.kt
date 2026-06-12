@@ -6,6 +6,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import org.json.JSONArray
@@ -20,7 +21,10 @@ private const val KEY_CURRENT_INDEX = "current_index"
 private const val KEY_ARMED_UNTIL = "armed_until"
 private const val AUTO_SEND_TIMEOUT_MS = 10 * 60_000L
 private const val COMPOSER_READY_DELAY_MS = 1_500L
+private const val BUTTON_RETRY_DELAY_MS = 700L
+private const val MAX_BUTTON_FIND_ATTEMPTS = 28
 private const val NEXT_RECIPIENT_DELAY_MS = 2_000L
+private const val TAG = "SmsAppAutoSend"
 
 object MmsAutoSendController {
     fun startQueue(
@@ -120,12 +124,15 @@ object MmsAutoSendController {
 class GoogleMessagesAutoSendService : AccessibilityService() {
     private val handler = Handler(Looper.getMainLooper())
     private var actionInProgress = false
+    private var findAttempts = 0
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event?.packageName?.toString() != GOOGLE_MESSAGES_PACKAGE) return
         if (!MmsAutoSendController.isArmed(this) || actionInProgress) return
 
         actionInProgress = true
+        findAttempts = 0
+        Log.i(TAG, "Google Messages composer detected; waiting for send button")
         handler.postDelayed({ clickCurrentSendButton() }, COMPOSER_READY_DELAY_MS)
     }
 
@@ -136,8 +143,30 @@ class GoogleMessagesAutoSendService : AccessibilityService() {
         }
 
         val sendButton = rootInActiveWindow?.let(::findSendButton)
-        if (sendButton?.performAction(AccessibilityNodeInfo.ACTION_CLICK) != true) {
-            actionInProgress = false
+        if (sendButton == null) {
+            findAttempts++
+            if (findAttempts < MAX_BUTTON_FIND_ATTEMPTS) {
+                handler.postDelayed({ clickCurrentSendButton() }, BUTTON_RETRY_DELAY_MS)
+            } else {
+                Log.e(TAG, "Send button not found after $findAttempts attempts")
+                actionInProgress = false
+            }
+            return
+        }
+
+        val clicked = sendButton.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        Log.i(
+            TAG,
+            "Send button click result=$clicked id=${sendButton.viewIdResourceName} " +
+                "label=${sendButton.contentDescription ?: sendButton.text}"
+        )
+        if (!clicked) {
+            findAttempts++
+            if (findAttempts < MAX_BUTTON_FIND_ATTEMPTS) {
+                handler.postDelayed({ clickCurrentSendButton() }, BUTTON_RETRY_DELAY_MS)
+            } else {
+                actionInProgress = false
+            }
             return
         }
 
@@ -148,10 +177,12 @@ class GoogleMessagesAutoSendService : AccessibilityService() {
 
         handler.postDelayed({
             if (!MmsAutoSendController.launchCurrentRecipient(this)) {
+                Log.e(TAG, "Failed to launch the next MMS recipient")
                 actionInProgress = false
                 return@postDelayed
             }
-            handler.postDelayed({ actionInProgress = false }, 500L)
+            findAttempts = 0
+            handler.postDelayed({ clickCurrentSendButton() }, COMPOSER_READY_DELAY_MS)
         }, NEXT_RECIPIENT_DELAY_MS)
     }
 
@@ -180,12 +211,14 @@ class GoogleMessagesAutoSendService : AccessibilityService() {
 
         return breadthFirst(root).firstOrNull { node ->
             if (!node.isVisibleToUser || !node.isEnabled) return@firstOrNull false
+            val resourceId = node.viewIdResourceName.orEmpty().lowercase()
             val label = listOf(node.text, node.contentDescription)
                 .joinToString(" ") { it?.toString().orEmpty() }
                 .trim()
                 .lowercase()
-            label == "보내기" || label.startsWith("보내기 ") ||
-                label == "send" || label.startsWith("send ")
+            resourceId.contains("send") ||
+                label == "보내기" || label.startsWith("보내기 ") || label.contains(" 보내기") ||
+                label == "send" || label.startsWith("send ") || label.contains(" send")
         }?.let(::clickableNode)
     }
 
