@@ -1,5 +1,5 @@
 <resources>
-    <string name="app_name">SMS_App</string>
-    <string name="accessibility_service_label">Google 메시지 MMS 자동 전송</string>
-    <string name="accessibility_service_description">이 앱에서 MMS 작성을 요청한 경우에만 Google 메시지의 보내기 버튼을 한 번 누릅니다.</string>
+    <string name="app_name">Signalist SMS</string>
+    <string name="accessibility_service_label">Google Messages MMS Auto Send</string>
+    <string name="accessibility_service_description">Only taps the verified Google Messages send button while an MMS queue is active.</string>
 </resources>

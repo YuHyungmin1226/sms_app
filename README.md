@@ -1,24 +1,64 @@
-# SMS App
+# Signalist SMS
 
-Android 연락처 그룹에서 수신자를 선택해 SMS, 장문 문자, 이미지 MMS를 작성하는 Compose 앱입니다.
+Signalist SMS is a Jetpack Compose Android app for sending messages to many recipients selected from the device contact list. It classifies each draft as SMS, LMS, or MMS and uses different send paths depending on whether an image is attached.
 
-## 전송 방식
+## Current behavior
 
-- SMS: `SmsManager.sendTextMessage`로 직접 전송합니다.
-- 장문: `SmsManager.divideMessage`로 구간을 계산하고 `sendMultipartTextMessage`로 직접 전송합니다. 단말과 통신사에 따라 여러 SMS로 과금되거나 장문 문자로 처리될 수 있습니다.
-- 이미지 MMS: 기본 문자 앱의 작성 화면을 열고 사용자가 최종 전송을 확인합니다. Android 공개 API만으로 통신사별 MMS PDU를 안정적으로 직접 생성하고 대량 발송하는 기능은 제공하지 않습니다.
+- Loads contacts and contact groups from the device address book.
+- Lets you filter recipients by group and select multiple contacts at once.
+- Classifies text-only drafts as:
+  - `SMS` when the draft fits in one SMS part.
+  - `LMS` when the draft spans multiple SMS parts.
+- Sends text-only drafts directly with `SmsManager`.
+  - Single-part text uses `sendTextMessage`.
+  - Multipart text uses `sendMultipartTextMessage`.
+- Treats any draft with an image attachment as `MMS`, even if the text is empty or short.
+- MMS is not sent through a direct carrier MMS API. Instead, the app opens Google Messages with the selected image and optional text, then uses the bundled accessibility service to press a verified Send button for each queued recipient when auto-send is enabled.
 
-## 권한
+## Runtime requirements
 
-- `READ_CONTACTS`: 연락처와 그룹 조회
-- `SEND_SMS`: SMS 및 장문 직접 전송
+- Android 7.0 or newer (`minSdk = 24`).
+- A telephony-capable device or emulator if you want to actually send SMS or LMS.
+- Google Messages installed and set as the default SMS app for the image MMS flow.
+- The app's accessibility service enabled if you want batch MMS auto-send through Google Messages.
 
-MMS 작성 화면은 설치된 기본 문자 앱을 사용합니다.
+## Permissions
 
-## 빌드
+- `READ_CONTACTS` to load contacts and groups.
+- `SEND_SMS` to send SMS and multipart SMS directly.
 
-JDK 17 이상과 Android SDK가 필요합니다.
+No extra MMS permission is requested because image MMS is handed off to Google Messages.
+
+## Build prerequisites
+
+- JDK 17.
+- Android SDK Platform 36 (`compileSdk = 36`, `targetSdk = 36`).
+- Gradle 9.1.0 is provided by the wrapper in this repository.
+
+If you build from the command line, make sure your Android SDK is installed and available through the normal Android environment variables or Android Studio setup.
+
+## Build and test
+
+Run unit tests:
+
+```powershell
+.\gradlew.bat testDebugUnitTest
+```
+
+Build a debug APK:
+
+```powershell
+.\gradlew.bat assembleDebug
+```
+
+Run both in one command:
 
 ```powershell
 .\gradlew.bat testDebugUnitTest assembleDebug
 ```
+
+## Notes on message types
+
+- `LMS` in the UI means the message will be split into multiple SMS parts before sending.
+- Carrier billing and final device behavior for multipart SMS can vary by network.
+- The MMS auto-send flow depends on the Google Messages UI, so it is best-effort rather than a low-level MMS transport implementation.

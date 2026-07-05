@@ -2,13 +2,18 @@ package com.example.sms_app
 
 import android.Manifest
 import android.accessibilityservice.AccessibilityServiceInfo
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.ContactsContract
 import android.provider.Settings
+import android.provider.Telephony
 import android.telephony.SmsManager
+import android.view.accessibility.AccessibilityManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -51,10 +56,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.lifecycleScope
 import com.example.sms_app.theme.SMSAppTheme
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.withContext
 
 data class Group(val id: String, val title: String)
 
@@ -68,14 +76,55 @@ data class Contact(
 
 enum class MessageType(val label: String) {
     SMS("SMS"),
-    LMS("LMS (장문)"),
-    MMS("MMS (이미지)")
+    LMS("LMS (Long)"),
+    MMS("MMS (Image)")
 }
 
 fun detectMessageType(partCount: Int, hasAttachment: Boolean): MessageType = when {
     hasAttachment -> MessageType.MMS
     partCount > 1 -> MessageType.LMS
     else -> MessageType.SMS
+}
+
+private object SmsBatchSender {
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    fun send(
+        appContext: Context,
+        smsManager: SmsManager,
+        recipients: List<String>,
+        message: String,
+        parts: ArrayList<String>
+    ) {
+        scope.launch {
+            var sentCount = 0
+            recipients.forEachIndexed { index, number ->
+                val sent = runCatching {
+                    if (parts.size == 1) {
+                        smsManager.sendTextMessage(number, null, message, null, null)
+                    } else {
+                        smsManager.sendMultipartTextMessage(number, null, parts, null, null)
+                    }
+                }.isSuccess
+                if (sent) {
+                    sentCount++
+                }
+                if (index < recipients.lastIndex) {
+                    delay(1_000L)
+                }
+            }
+
+            val messageKind = if (parts.size == 1) "SMS" else "LMS"
+            mainHandler.post {
+                Toast.makeText(
+                    appContext,
+                    "$messageKind send requests finished: $sentCount/${recipients.size}",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
+    }
 }
 
 class MainActivity : ComponentActivity() {
@@ -86,10 +135,18 @@ class MainActivity : ComponentActivity() {
     ) { permissions ->
         permissionRevision++
         if (permissions[Manifest.permission.READ_CONTACTS] != true) {
-            Toast.makeText(this, "연락처를 표시하려면 연락처 권한이 필요합니다.", Toast.LENGTH_LONG).show()
+            Toast.makeText(
+                this,
+                "Contacts permission is required to list recipients.",
+                Toast.LENGTH_LONG
+            ).show()
         }
         if (permissions[Manifest.permission.SEND_SMS] != true) {
-            Toast.makeText(this, "SMS와 장문을 직접 보내려면 SMS 권한이 필요합니다.", Toast.LENGTH_LONG).show()
+            Toast.makeText(
+                this,
+                "SMS permission is required to send SMS or LMS directly.",
+                Toast.LENGTH_LONG
+            ).show()
         }
     }
 
@@ -132,7 +189,9 @@ class MainActivity : ComponentActivity() {
             val titleIndex = cursor.getColumnIndexOrThrow(ContactsContract.Groups.TITLE)
             while (cursor.moveToNext()) {
                 val title = cursor.getString(titleIndex)
-                if (!title.isNullOrBlank()) groups += Group(cursor.getString(idIndex), title)
+                if (!title.isNullOrBlank()) {
+                    groups += Group(cursor.getString(idIndex), title)
+                }
             }
         }
         return groups
@@ -141,7 +200,7 @@ class MainActivity : ComponentActivity() {
     fun getContacts(): List<Contact> {
         if (!hasPermission(Manifest.permission.READ_CONTACTS)) return emptyList()
 
-        val groupMemberships = mutableMapOf<String, MutableList<String>>()
+        val groupMemberships = mutableMapOf<String, MutableSet<String>>()
         contentResolver.query(
             ContactsContract.Data.CONTENT_URI,
             arrayOf(
@@ -160,12 +219,12 @@ class MainActivity : ComponentActivity() {
                 val contactId = cursor.getString(contactIdIndex)
                 val groupId = cursor.getString(groupIdIndex)
                 if (contactId != null && groupId != null) {
-                    groupMemberships.getOrPut(contactId) { mutableListOf() } += groupId
+                    groupMemberships.getOrPut(contactId) { linkedSetOf() }.add(groupId)
                 }
             }
         }
 
-        val contacts = mutableListOf<Contact>()
+        val contactsByNumber = linkedMapOf<String, Contact>()
         contentResolver.query(
             ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
             arrayOf(
@@ -182,91 +241,119 @@ class MainActivity : ComponentActivity() {
             val numberIndex = cursor.getColumnIndexOrThrow(ContactsContract.CommonDataKinds.Phone.NUMBER)
             while (cursor.moveToNext()) {
                 val id = cursor.getString(idIndex)
-                contacts += Contact(
+                val phoneNumber = cursor.getString(numberIndex).orEmpty()
+                val normalizedNumber = normalizePhoneNumber(phoneNumber)
+                if (normalizedNumber.isBlank()) continue
+
+                val nextContact = Contact(
                     id = id,
                     name = cursor.getString(nameIndex).orEmpty(),
-                    phoneNumber = cursor.getString(numberIndex).orEmpty(),
-                    groupIds = groupMemberships[id].orEmpty()
+                    phoneNumber = phoneNumber,
+                    groupIds = groupMemberships[id].orEmpty().toList()
                 )
+                contactsByNumber[normalizedNumber] = contactsByNumber[normalizedNumber]
+                    ?.mergeWith(nextContact)
+                    ?: nextContact
             }
         }
-        return contacts.distinctBy { normalizePhoneNumber(it.phoneNumber) }
+
+        return contactsByNumber.values.toList()
     }
 
     fun messagePartCount(message: String): Int {
         if (message.isEmpty()) return 0
-        return getSystemService(SmsManager::class.java).divideMessage(message).size
+        val smsManager = getSystemService(SmsManager::class.java) ?: return 1
+        return runCatching { smsManager.divideMessage(message).size }.getOrDefault(1)
     }
 
     fun sendTextMessages(phoneNumbers: List<String>, message: String): Boolean {
         if (!hasPermission(Manifest.permission.SEND_SMS)) {
-            Toast.makeText(this, "SMS 전송 권한이 없습니다.", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "SMS permission is not granted.", Toast.LENGTH_SHORT).show()
             return false
         }
         if (!packageManager.hasSystemFeature(PackageManager.FEATURE_TELEPHONY_MESSAGING)) {
-            Toast.makeText(this, "이 기기는 문자 전송을 지원하지 않습니다.", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "This device cannot send SMS messages.", Toast.LENGTH_SHORT).show()
+            return false
+        }
+
+        val recipients = phoneNumbers
+            .map(String::trim)
+            .filter { normalizePhoneNumber(it).isNotBlank() }
+        if (recipients.isEmpty()) {
+            Toast.makeText(this, "No valid recipient numbers were selected.", Toast.LENGTH_SHORT).show()
+            return false
+        }
+
+        val smsManager = getSystemService(SmsManager::class.java)
+        if (smsManager == null) {
+            Toast.makeText(this, "SmsManager is unavailable on this device.", Toast.LENGTH_SHORT).show()
             return false
         }
 
         return try {
-            val smsManager = getSystemService(SmsManager::class.java)
-            val parts = smsManager.divideMessage(message)
-            lifecycleScope.launch {
-                var successCount = 0
-                phoneNumbers.forEachIndexed { index, number ->
-                    val sent = runCatching {
-                        if (parts.size == 1) {
-                            smsManager.sendTextMessage(number, null, message, null, null)
-                        } else {
-                            smsManager.sendMultipartTextMessage(number, null, parts, null, null)
-                        }
-                    }.isSuccess
-                    if (sent) successCount++
-                    if (index < phoneNumbers.lastIndex) delay(1_000L)
-                }
-                val type = if (parts.size == 1) "SMS" else "장문 문자"
-                Toast.makeText(
-                    this@MainActivity,
-                    "$type 개별 전송 요청 완료: $successCount/${phoneNumbers.size}명",
-                    Toast.LENGTH_LONG
-                ).show()
-            }
-            Toast.makeText(this, "${phoneNumbers.size}명에게 개별 순차 전송을 시작합니다.", Toast.LENGTH_SHORT).show()
+            val parts = ArrayList(smsManager.divideMessage(message))
+            SmsBatchSender.send(applicationContext, smsManager, recipients, message, parts)
+
+            Toast.makeText(
+                this,
+                "Started sequential sending for ${recipients.size} recipients.",
+                Toast.LENGTH_SHORT
+            ).show()
             true
         } catch (exception: Exception) {
-            Toast.makeText(this, "전송 실패: ${exception.message}", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "Send failed: ${exception.message}", Toast.LENGTH_LONG).show()
             false
         }
     }
 
     fun openMmsComposer(phoneNumbers: List<String>, message: String, attachmentUri: Uri): Boolean {
+        val recipients = phoneNumbers
+            .map(String::trim)
+            .filter { normalizePhoneNumber(it).isNotBlank() }
+        if (recipients.isEmpty()) {
+            Toast.makeText(this, "No valid recipient numbers were selected.", Toast.LENGTH_SHORT).show()
+            return false
+        }
+
         val mimeType = contentResolver.getType(attachmentUri) ?: "image/*"
         if (!isAutoSendAccessibilityEnabled()) {
             MmsAutoSendController.clear(this)
             Toast.makeText(
                 this,
-                "33명 개별 MMS 자동 전송을 시작하려면 접근성 서비스를 켜 주세요.",
+                "Turn on the accessibility service before starting MMS auto-send.",
                 Toast.LENGTH_LONG
             ).show()
             return false
         }
 
         if (!isGoogleMessagesInstalled()) {
-            Toast.makeText(this, "Google 메시지 앱이 설치되어 있지 않습니다.", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "Google Messages is not installed.", Toast.LENGTH_LONG).show()
+            return false
+        }
+        if (Telephony.Sms.getDefaultSmsPackage(this) != "com.google.android.apps.messaging") {
+            Toast.makeText(
+                this,
+                "Set Google Messages as the default SMS app before using MMS auto-send.",
+                Toast.LENGTH_LONG
+            ).show()
             return false
         }
 
         val started = MmsAutoSendController.startQueue(
             context = this,
-            recipients = phoneNumbers,
+            recipients = recipients,
             message = message,
             attachmentUri = attachmentUri,
             mimeType = mimeType
         )
         if (started) {
-            Toast.makeText(this, "${phoneNumbers.size}명에게 개별 MMS 순차 전송을 시작합니다.", Toast.LENGTH_LONG).show()
+            Toast.makeText(
+                this,
+                "Queued ${recipients.size} MMS recipients in Google Messages.",
+                Toast.LENGTH_LONG
+            ).show()
         } else {
-            Toast.makeText(this, "Google 메시지를 열 수 없습니다.", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "Google Messages could not be opened.", Toast.LENGTH_LONG).show()
         }
         return started
     }
@@ -282,7 +369,7 @@ class MainActivity : ComponentActivity() {
     }
 
     fun isAutoSendAccessibilityEnabled(): Boolean {
-        val manager = getSystemService(android.view.accessibility.AccessibilityManager::class.java)
+        val manager = getSystemService(AccessibilityManager::class.java) ?: return false
         return manager
             .getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK)
             .any { info ->
@@ -295,8 +382,19 @@ class MainActivity : ComponentActivity() {
         ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
 }
 
-private fun normalizePhoneNumber(number: String): String =
+internal fun normalizePhoneNumber(number: String): String =
     number.filter { it.isDigit() || it == '+' }
+
+private fun Contact.mergeWith(other: Contact): Contact {
+    val mergedGroupIds = linkedSetOf<String>().apply {
+        addAll(groupIds)
+        addAll(other.groupIds)
+    }
+    return copy(
+        name = if (name.isBlank()) other.name else name,
+        groupIds = mergedGroupIds.toList()
+    )
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -314,8 +412,11 @@ fun SmsAppScreen(activity: MainActivity, permissionRevision: Int) {
 
     LaunchedEffect(permissionRevision) {
         isLoading = true
-        contacts = activity.getContacts()
-        groups = activity.getGroups()
+        val (loadedContacts, loadedGroups) = withContext(Dispatchers.IO) {
+            activity.getContacts() to activity.getGroups()
+        }
+        contacts = loadedContacts
+        groups = loadedGroups
         isLoading = false
     }
 
@@ -324,84 +425,102 @@ fun SmsAppScreen(activity: MainActivity, permissionRevision: Int) {
     } else {
         contacts.filter { selectedGroupId in it.groupIds }
     }
+    val selectedCount = contacts.count { it.isSelected }
     val allSelected = filteredContacts.isNotEmpty() && filteredContacts.all { it.isSelected }
     val partCount = remember(message) { activity.messagePartCount(message) }
     val messageType = detectMessageType(partCount, attachmentUri != null)
     val autoSendEnabled = remember(permissionRevision) {
         activity.isAutoSendAccessibilityEnabled()
     }
+    val supportCopy = when {
+        message.isBlank() && attachmentUri == null -> "Enter a message or attach an image."
+        messageType == MessageType.SMS -> "This will be sent as one SMS segment."
+        messageType == MessageType.LMS -> "This will be split into $partCount SMS segments."
+        autoSendEnabled -> "Google Messages will open and attempt a sequential MMS send."
+        else -> "Enable the accessibility service before using MMS auto-send."
+    }
 
     Scaffold(
-        topBar = { TopAppBar(title = { Text("단체 SMS / LMS / MMS") }) },
+        topBar = { TopAppBar(title = { Text("Group SMS / LMS / MMS") }) },
         floatingActionButton = {
             ExtendedFloatingActionButton(
                 onClick = {
-                    val selectedNumbers = contacts.filter { it.isSelected }.map { it.phoneNumber }
+                    val selectedNumbers = contacts
+                        .filter { it.isSelected }
+                        .map { it.phoneNumber }
+
                     when {
                         selectedNumbers.isEmpty() -> Toast.makeText(
                             activity,
-                            "연락처를 하나 이상 선택해 주세요.",
+                            "Select at least one contact.",
                             Toast.LENGTH_SHORT
                         ).show()
+
                         message.isBlank() && attachmentUri == null -> Toast.makeText(
                             activity,
-                            "메시지나 이미지를 입력해 주세요.",
+                            "Enter a message or attach an image first.",
                             Toast.LENGTH_SHORT
                         ).show()
+
                         attachmentUri != null -> {
                             activity.openMmsComposer(selectedNumbers, message, attachmentUri!!)
                         }
+
                         activity.sendTextMessages(selectedNumbers, message) -> {
                             contacts = contacts.map { it.copy(isSelected = false) }
                         }
                     }
                 },
-                content = { Text("${messageType.label} 보내기 (${contacts.count { it.isSelected }}명)") }
+                text = { Text("${messageType.label} Send ($selectedCount)") }
             )
         }
     ) { padding ->
-        Column(modifier = Modifier.padding(padding).fillMaxSize()) {
+        Column(
+            modifier = Modifier
+                .padding(padding)
+                .fillMaxSize()
+        ) {
             OutlinedTextField(
                 value = message,
                 onValueChange = { message = it },
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
-                label = { Text("보낼 메시지") },
-                supportingText = {
-                    val detail = when (messageType) {
-                        MessageType.SMS -> "SMS 1건"
-                        MessageType.LMS -> "장문 문자: SMS ${partCount}개 구간으로 분할 전송"
-                        MessageType.MMS -> if (autoSendEnabled) {
-                            "수신자별로 Google 메시지를 열어 개별 순차 전송합니다"
-                        } else {
-                            "접근성 서비스를 켜야 자동 전송됩니다"
-                        }
-                    }
-                    Text(detail)
-                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                label = { Text("Message") },
+                supportingText = { Text(supportCopy) },
                 maxLines = 6
             )
 
             Row(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 OutlinedButton(onClick = { imagePicker.launch("image/*") }) {
-                    Text(if (attachmentUri == null) "이미지 첨부" else "이미지 변경")
+                    Text(if (attachmentUri == null) "Attach image" else "Change image")
                 }
                 if (attachmentUri != null) {
-                    OutlinedButton(onClick = { attachmentUri = null }) { Text("첨부 삭제") }
+                    OutlinedButton(onClick = { attachmentUri = null }) {
+                        Text("Remove attachment")
+                    }
                 }
             }
 
             Row(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
                 Text(
-                    if (autoSendEnabled) "Google 메시지 자동 전송: 켜짐"
-                    else "Google 메시지 자동 전송: 꺼짐",
+                    text = if (autoSendEnabled) {
+                        "Google Messages auto-send is on"
+                    } else {
+                        "Google Messages auto-send is off"
+                    },
                     color = if (autoSendEnabled) {
                         MaterialTheme.colorScheme.primary
                     } else {
@@ -409,12 +528,14 @@ fun SmsAppScreen(activity: MainActivity, permissionRevision: Int) {
                     }
                 )
                 OutlinedButton(onClick = activity::openAccessibilitySettings) {
-                    Text("접근성 설정")
+                    Text("Accessibility")
                 }
             }
 
             LazyRow(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 item {
@@ -424,7 +545,7 @@ fun SmsAppScreen(activity: MainActivity, permissionRevision: Int) {
                             selectedGroupId = null
                             contacts = contacts.map { it.copy(isSelected = false) }
                         },
-                        label = { Text("전체") }
+                        label = { Text("All") }
                     )
                 }
                 items(groups) { group ->
@@ -441,7 +562,9 @@ fun SmsAppScreen(activity: MainActivity, permissionRevision: Int) {
 
             if (isLoading) {
                 CircularProgressIndicator(
-                    modifier = Modifier.align(Alignment.CenterHorizontally).padding(16.dp)
+                    modifier = Modifier
+                        .align(Alignment.CenterHorizontally)
+                        .padding(16.dp)
                 )
             } else {
                 Row(
@@ -453,7 +576,9 @@ fun SmsAppScreen(activity: MainActivity, permissionRevision: Int) {
                             contacts = contacts.map { contact ->
                                 if ((contact.id to contact.phoneNumber) in visibleKeys) {
                                     contact.copy(isSelected = newStatus)
-                                } else contact
+                                } else {
+                                    contact
+                                }
                             }
                         }
                         .padding(horizontal = 16.dp, vertical = 8.dp),
@@ -461,7 +586,10 @@ fun SmsAppScreen(activity: MainActivity, permissionRevision: Int) {
                 ) {
                     Checkbox(checked = allSelected, onCheckedChange = null)
                     Spacer(modifier = Modifier.width(16.dp))
-                    Text("전체 선택 (${filteredContacts.size}명)", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        text = "Select all (${filteredContacts.size})",
+                        style = MaterialTheme.typography.titleMedium
+                    )
                 }
 
                 HorizontalDivider()
@@ -475,7 +603,9 @@ fun SmsAppScreen(activity: MainActivity, permissionRevision: Int) {
                             contacts = contacts.map {
                                 if (it.id == contact.id && it.phoneNumber == contact.phoneNumber) {
                                     it.copy(isSelected = isChecked)
-                                } else it
+                                } else {
+                                    it
+                                }
                             }
                         }
                     }
@@ -499,7 +629,7 @@ fun ContactItem(contact: Contact, onCheckedChange: (Boolean) -> Unit) {
         Column {
             Text(contact.name, style = MaterialTheme.typography.bodyLarge)
             Text(
-                contact.phoneNumber,
+                text = contact.phoneNumber,
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )

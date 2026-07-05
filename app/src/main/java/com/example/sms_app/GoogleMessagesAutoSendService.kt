@@ -1,6 +1,7 @@
 package com.example.sms_app
 
 import android.accessibilityservice.AccessibilityService
+import android.content.ClipData
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -34,10 +35,13 @@ object MmsAutoSendController {
         attachmentUri: Uri,
         mimeType: String
     ): Boolean {
-        if (recipients.isEmpty()) return false
+        val sanitizedRecipients = recipients
+            .map(String::trim)
+            .filter(String::isNotBlank)
+        if (sanitizedRecipients.isEmpty()) return false
 
         val recipientJson = JSONArray().apply {
-            recipients.forEach(::put)
+            sanitizedRecipients.forEach(::put)
         }
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
@@ -59,7 +63,12 @@ object MmsAutoSendController {
             clear(context)
             return false
         }
-        return currentRecipient(context) != null
+
+        val armed = currentRecipient(context) != null
+        if (!armed) {
+            clear(context)
+        }
+        return armed
     }
 
     fun advance(context: Context): Boolean {
@@ -76,8 +85,13 @@ object MmsAutoSendController {
 
     fun launchCurrentRecipient(context: Context): Boolean {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val recipient = currentRecipient(context) ?: return false
-        val attachmentUri = prefs.getString(KEY_ATTACHMENT_URI, null)?.let(Uri::parse) ?: return false
+        val recipient = currentRecipient(context)
+        val attachmentUri = prefs.getString(KEY_ATTACHMENT_URI, null)?.let(Uri::parse)
+        if (recipient == null || attachmentUri == null) {
+            clear(context)
+            return false
+        }
+
         val message = prefs.getString(KEY_MESSAGE, "").orEmpty()
         val mimeType = prefs.getString(KEY_MIME_TYPE, "image/*") ?: "image/*"
 
@@ -86,6 +100,7 @@ object MmsAutoSendController {
             attachmentUri,
             Intent.FLAG_GRANT_READ_URI_PERMISSION
         )
+
         val intent = Intent(Intent.ACTION_SEND).apply {
             type = mimeType
             setPackage(GOOGLE_MESSAGES_PACKAGE)
@@ -93,8 +108,10 @@ object MmsAutoSendController {
             putExtra("sms_body", message)
             putExtra(Intent.EXTRA_TEXT, message)
             putExtra(Intent.EXTRA_STREAM, attachmentUri)
+            clipData = ClipData.newUri(context.contentResolver, "MMS attachment", attachmentUri)
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
+
         return runCatching {
             context.startActivity(intent)
             true
@@ -105,7 +122,15 @@ object MmsAutoSendController {
     }
 
     fun clear(context: Context) {
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit().clear().apply()
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefs.getString(KEY_ATTACHMENT_URI, null)
+            ?.let(Uri::parse)
+            ?.let { attachmentUri ->
+                runCatching {
+                    context.revokeUriPermission(attachmentUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+            }
+        prefs.edit().clear().apply()
     }
 
     private fun currentRecipient(context: Context): String? {
@@ -117,7 +142,9 @@ object MmsAutoSendController {
     private fun recipients(json: String?): List<String> {
         if (json.isNullOrBlank()) return emptyList()
         val array = runCatching { JSONArray(json) }.getOrNull() ?: return emptyList()
-        return List(array.length()) { index -> array.optString(index) }.filter(String::isNotBlank)
+        return List(array.length()) { index -> array.optString(index) }
+            .map(String::trim)
+            .filter(String::isNotBlank)
     }
 }
 
@@ -132,7 +159,7 @@ class GoogleMessagesAutoSendService : AccessibilityService() {
 
         actionInProgress = true
         findAttempts = 0
-        Log.i(TAG, "Google Messages composer detected; waiting for send button")
+        Log.i(TAG, "Google Messages composer detected; waiting for a verified send button")
         handler.postDelayed({ clickCurrentSendButton() }, COMPOSER_READY_DELAY_MS)
     }
 
@@ -148,7 +175,8 @@ class GoogleMessagesAutoSendService : AccessibilityService() {
             if (findAttempts < MAX_BUTTON_FIND_ATTEMPTS) {
                 handler.postDelayed({ clickCurrentSendButton() }, BUTTON_RETRY_DELAY_MS)
             } else {
-                Log.e(TAG, "Send button not found after $findAttempts attempts")
+                Log.e(TAG, "Verified send button not found after $findAttempts attempts")
+                MmsAutoSendController.clear(this)
                 actionInProgress = false
             }
             return
@@ -165,6 +193,7 @@ class GoogleMessagesAutoSendService : AccessibilityService() {
             if (findAttempts < MAX_BUTTON_FIND_ATTEMPTS) {
                 handler.postDelayed({ clickCurrentSendButton() }, BUTTON_RETRY_DELAY_MS)
             } else {
+                MmsAutoSendController.clear(this)
                 actionInProgress = false
             }
             return
@@ -208,18 +237,7 @@ class GoogleMessagesAutoSendService : AccessibilityService() {
                 ?.let(::clickableNode)
                 ?.let { return it }
         }
-
-        return breadthFirst(root).firstOrNull { node ->
-            if (!node.isVisibleToUser || !node.isEnabled) return@firstOrNull false
-            val resourceId = node.viewIdResourceName.orEmpty().lowercase()
-            val label = listOf(node.text, node.contentDescription)
-                .joinToString(" ") { it?.toString().orEmpty() }
-                .trim()
-                .lowercase()
-            resourceId.contains("send") ||
-                label == "보내기" || label.startsWith("보내기 ") || label.contains(" 보내기") ||
-                label == "send" || label.startsWith("send ") || label.contains(" send")
-        }?.let(::clickableNode)
+        return null
     }
 
     private fun clickableNode(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
@@ -229,17 +247,5 @@ class GoogleMessagesAutoSendService : AccessibilityService() {
             current = current?.parent
         }
         return null
-    }
-
-    private fun breadthFirst(root: AccessibilityNodeInfo): Sequence<AccessibilityNodeInfo> = sequence {
-        val queue = ArrayDeque<AccessibilityNodeInfo>()
-        queue.add(root)
-        while (queue.isNotEmpty()) {
-            val node = queue.removeFirst()
-            yield(node)
-            for (index in 0 until node.childCount) {
-                node.getChild(index)?.let(queue::addLast)
-            }
-        }
     }
 }
