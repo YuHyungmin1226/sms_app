@@ -471,7 +471,7 @@ fun SmsAppScreen(activity: MainActivity, permissionRevision: Int) {
                         }
                     }
                 },
-                text = { Text("${messageType.label} Send ($selectedCount)") }
+                content = { Text("${messageType.label} Send ($selectedCount)") }
             )
         }
     ) { padding ->
