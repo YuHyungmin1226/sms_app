@@ -4,6 +4,7 @@ import android.Manifest
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
@@ -38,6 +39,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -46,7 +48,9 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -98,30 +102,86 @@ private object SmsBatchSender {
         parts: ArrayList<String>
     ) {
         scope.launch {
-            var sentCount = 0
-            recipients.forEachIndexed { index, number ->
-                val sent = runCatching {
-                    if (parts.size == 1) {
-                        smsManager.sendTextMessage(number, null, message, null, null)
-                    } else {
-                        smsManager.sendMultipartTextMessage(number, null, parts, null, null)
-                    }
-                }.isSuccess
-                if (sent) {
-                    sentCount++
-                }
-                if (index < recipients.lastIndex) {
-                    delay(1_000L)
-                }
-            }
+            val messageType = if (parts.size == 1) MessageType.SMS else MessageType.LMS
+            SendProgressTracker.start(
+                context = appContext,
+                messageType = messageType,
+                totalRecipients = recipients.size,
+                currentRecipient = recipients.firstOrNull(),
+                statusText = "Queued ${messageType.label} send for ${recipients.size} recipients."
+            )
 
-            val messageKind = if (parts.size == 1) "SMS" else "LMS"
-            mainHandler.post {
-                Toast.makeText(
-                    appContext,
-                    "$messageKind send requests finished: $sentCount/${recipients.size}",
-                    Toast.LENGTH_LONG
-                ).show()
+            try {
+                var sentCount = 0
+                recipients.forEachIndexed { index, number ->
+                    SendProgressTracker.update(
+                        context = appContext,
+                        messageType = messageType,
+                        totalRecipients = recipients.size,
+                        completedRecipients = index,
+                        successfulRecipients = sentCount,
+                        currentRecipient = number,
+                        statusText = "Sending ${messageType.label} ${index + 1} of ${recipients.size}."
+                    )
+
+                    val sent = runCatching {
+                        if (parts.size == 1) {
+                            smsManager.sendTextMessage(number, null, message, null, null)
+                        } else {
+                            smsManager.sendMultipartTextMessage(number, null, parts, null, null)
+                        }
+                    }.isSuccess
+                    if (sent) {
+                        sentCount++
+                    }
+
+                    SendProgressTracker.update(
+                        context = appContext,
+                        messageType = messageType,
+                        totalRecipients = recipients.size,
+                        completedRecipients = index + 1,
+                        successfulRecipients = sentCount,
+                        currentRecipient = number,
+                        statusText = if (sent) {
+                            "Processed ${index + 1} of ${recipients.size} recipients."
+                        } else {
+                            "A send request failed at recipient ${index + 1} of ${recipients.size}."
+                        }
+                    )
+
+                    if (index < recipients.lastIndex) {
+                        delay(1_000L)
+                    }
+                }
+
+                val messageKind = if (parts.size == 1) "SMS" else "LMS"
+                SendProgressTracker.complete(
+                    context = appContext,
+                    messageType = messageType,
+                    totalRecipients = recipients.size,
+                    completedRecipients = recipients.size,
+                    successfulRecipients = sentCount,
+                    currentRecipient = recipients.lastOrNull(),
+                    statusText = "Finished $messageKind requests: $sentCount/${recipients.size} succeeded."
+                )
+
+                mainHandler.post {
+                    Toast.makeText(
+                        appContext,
+                        "$messageKind send requests finished: $sentCount/${recipients.size}",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            } catch (exception: Exception) {
+                SendProgressTracker.fail(
+                    context = appContext,
+                    messageType = messageType,
+                    totalRecipients = recipients.size,
+                    completedRecipients = 0,
+                    successfulRecipients = 0,
+                    currentRecipient = recipients.firstOrNull(),
+                    statusText = "Sending stopped unexpectedly: ${exception.message ?: "unknown error"}"
+                )
             }
         }
     }
@@ -405,9 +465,21 @@ fun SmsAppScreen(activity: MainActivity, permissionRevision: Int) {
     var groups by remember { mutableStateOf(emptyList<Group>()) }
     var selectedGroupId by remember { mutableStateOf<String?>(null) }
     var isLoading by remember { mutableStateOf(true) }
+    val sendProgress by SendProgressTracker.state.collectAsState()
 
     val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         attachmentUri = uri
+    }
+
+    DisposableEffect(activity) {
+        SendProgressTracker.refresh(activity)
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
+            SendProgressTracker.refresh(activity)
+        }
+        SendProgressTracker.registerListener(activity, listener)
+        onDispose {
+            SendProgressTracker.unregisterListener(activity, listener)
+        }
     }
 
     LaunchedEffect(permissionRevision) {
@@ -432,6 +504,7 @@ fun SmsAppScreen(activity: MainActivity, permissionRevision: Int) {
     val autoSendEnabled = remember(permissionRevision) {
         activity.isAutoSendAccessibilityEnabled()
     }
+    val isSending = sendProgress?.isActive == true
     val supportCopy = when {
         message.isBlank() && attachmentUri == null -> "Enter a message or attach an image."
         messageType == MessageType.SMS -> "This will be sent as one SMS segment."
@@ -445,6 +518,15 @@ fun SmsAppScreen(activity: MainActivity, permissionRevision: Int) {
         floatingActionButton = {
             ExtendedFloatingActionButton(
                 onClick = {
+                    if (isSending) {
+                        Toast.makeText(
+                            activity,
+                            "A batch send is already in progress.",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                        return@ExtendedFloatingActionButton
+                    }
+
                     val selectedNumbers = contacts
                         .filter { it.isSelected }
                         .map { it.phoneNumber }
@@ -471,7 +553,15 @@ fun SmsAppScreen(activity: MainActivity, permissionRevision: Int) {
                         }
                     }
                 },
-                content = { Text("${messageType.label} Send ($selectedCount)") }
+                content = {
+                    Text(
+                        if (isSending && sendProgress != null) {
+                            "${sendProgress!!.messageType.label} ${sendProgress!!.completedRecipients}/${sendProgress!!.totalRecipients}"
+                        } else {
+                            "${messageType.label} Send ($selectedCount)"
+                        }
+                    )
+                }
             )
         }
     ) { padding ->
@@ -530,6 +620,13 @@ fun SmsAppScreen(activity: MainActivity, permissionRevision: Int) {
                 OutlinedButton(onClick = activity::openAccessibilitySettings) {
                     Text("Accessibility")
                 }
+            }
+
+            sendProgress?.let { progress ->
+                SendProgressPanel(
+                    progress = progress,
+                    onDismiss = { SendProgressTracker.clear(activity) }
+                )
             }
 
             LazyRow(
@@ -608,6 +705,96 @@ fun SmsAppScreen(activity: MainActivity, permissionRevision: Int) {
                                 }
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SendProgressPanel(
+    progress: SendProgressState,
+    onDismiss: () -> Unit
+) {
+    val progressLabel = buildString {
+        append(progress.messageType.label)
+        append(" ")
+        append(progress.completedRecipients)
+        append("/")
+        append(progress.totalRecipients)
+        append(" processed")
+        if (progress.successfulRecipients != progress.completedRecipients || !progress.isActive) {
+            append(" • ")
+            append(progress.successfulRecipients)
+            append(" ok")
+        }
+    }
+
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 4.dp),
+        tonalElevation = 2.dp,
+        shape = MaterialTheme.shapes.medium,
+        color = if (progress.isError) {
+            MaterialTheme.colorScheme.errorContainer
+        } else {
+            MaterialTheme.colorScheme.surfaceVariant
+        }
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text(
+                text = if (progress.isActive) "Sending in progress" else "Last batch result",
+                style = MaterialTheme.typography.titleSmall,
+                color = if (progress.isError) {
+                    MaterialTheme.colorScheme.onErrorContainer
+                } else {
+                    MaterialTheme.colorScheme.onSurface
+                }
+            )
+            Text(
+                text = progress.statusText,
+                style = MaterialTheme.typography.bodyMedium,
+                color = if (progress.isError) {
+                    MaterialTheme.colorScheme.onErrorContainer
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                }
+            )
+            Text(
+                text = progress.currentRecipient?.let { "Current recipient: $it" } ?: "Waiting for the next recipient.",
+                style = MaterialTheme.typography.bodySmall,
+                color = if (progress.isError) {
+                    MaterialTheme.colorScheme.onErrorContainer
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                }
+            )
+            LinearProgressIndicator(
+                progress = { progress.progressFraction },
+                modifier = Modifier.fillMaxWidth()
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = progressLabel,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = if (progress.isError) {
+                        MaterialTheme.colorScheme.onErrorContainer
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    }
+                )
+                if (!progress.isActive) {
+                    OutlinedButton(onClick = onDismiss) {
+                        Text("Dismiss")
                     }
                 }
             }

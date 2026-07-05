@@ -1,6 +1,9 @@
 *.iml
 .gradle
+.kotlin/
+.omo/
 /local.properties
+/SMS_App.apk
 /.idea/caches
 /.idea/libraries
 /.idea/modules.xml

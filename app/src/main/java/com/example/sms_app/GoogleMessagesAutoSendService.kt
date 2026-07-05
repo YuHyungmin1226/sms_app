@@ -27,6 +27,12 @@ private const val MAX_BUTTON_FIND_ATTEMPTS = 28
 private const val NEXT_RECIPIENT_DELAY_MS = 2_000L
 private const val TAG = "SmsAppAutoSend"
 
+data class MmsQueueSnapshot(
+    val totalRecipients: Int,
+    val currentIndex: Int,
+    val currentRecipient: String?
+)
+
 object MmsAutoSendController {
     fun startQueue(
         context: Context,
@@ -53,6 +59,13 @@ object MmsAutoSendController {
             .putLong(KEY_ARMED_UNTIL, System.currentTimeMillis() + AUTO_SEND_TIMEOUT_MS)
             .apply()
 
+        SendProgressTracker.start(
+            context = context,
+            messageType = MessageType.MMS,
+            totalRecipients = sanitizedRecipients.size,
+            currentRecipient = sanitizedRecipients.firstOrNull(),
+            statusText = "Opening Google Messages for recipient 1 of ${sanitizedRecipients.size}."
+        )
         return launchCurrentRecipient(context)
     }
 
@@ -85,15 +98,34 @@ object MmsAutoSendController {
 
     fun launchCurrentRecipient(context: Context): Boolean {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val recipient = currentRecipient(context)
+        val snapshot = snapshot(context)
+        val recipient = snapshot?.currentRecipient
         val attachmentUri = prefs.getString(KEY_ATTACHMENT_URI, null)?.let(Uri::parse)
         if (recipient == null || attachmentUri == null) {
+            SendProgressTracker.fail(
+                context = context,
+                messageType = MessageType.MMS,
+                totalRecipients = snapshot?.totalRecipients ?: 0,
+                completedRecipients = snapshot?.currentIndex ?: 0,
+                successfulRecipients = snapshot?.currentIndex ?: 0,
+                currentRecipient = recipient,
+                statusText = "MMS queue is missing the next recipient or attachment."
+            )
             clear(context)
             return false
         }
 
         val message = prefs.getString(KEY_MESSAGE, "").orEmpty()
         val mimeType = prefs.getString(KEY_MIME_TYPE, "image/*") ?: "image/*"
+        SendProgressTracker.update(
+            context = context,
+            messageType = MessageType.MMS,
+            totalRecipients = snapshot.totalRecipients,
+            completedRecipients = snapshot.currentIndex,
+            successfulRecipients = snapshot.currentIndex,
+            currentRecipient = recipient,
+            statusText = "Preparing recipient ${snapshot.currentIndex + 1} of ${snapshot.totalRecipients} in Google Messages."
+        )
 
         context.grantUriPermission(
             GOOGLE_MESSAGES_PACKAGE,
@@ -116,6 +148,15 @@ object MmsAutoSendController {
             context.startActivity(intent)
             true
         }.getOrElse {
+            SendProgressTracker.fail(
+                context = context,
+                messageType = MessageType.MMS,
+                totalRecipients = snapshot.totalRecipients,
+                completedRecipients = snapshot.currentIndex,
+                successfulRecipients = snapshot.currentIndex,
+                currentRecipient = recipient,
+                statusText = "Google Messages could not be opened for the next recipient."
+            )
             clear(context)
             false
         }
@@ -137,6 +178,18 @@ object MmsAutoSendController {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val allRecipients = recipients(prefs.getString(KEY_RECIPIENTS, null))
         return allRecipients.getOrNull(prefs.getInt(KEY_CURRENT_INDEX, 0))
+    }
+
+    fun snapshot(context: Context): MmsQueueSnapshot? {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val allRecipients = recipients(prefs.getString(KEY_RECIPIENTS, null))
+        if (allRecipients.isEmpty()) return null
+        val currentIndex = prefs.getInt(KEY_CURRENT_INDEX, 0)
+        return MmsQueueSnapshot(
+            totalRecipients = allRecipients.size,
+            currentIndex = currentIndex,
+            currentRecipient = allRecipients.getOrNull(currentIndex)
+        )
     }
 
     private fun recipients(json: String?): List<String> {
@@ -169,18 +222,52 @@ class GoogleMessagesAutoSendService : AccessibilityService() {
             return
         }
 
+        val queueSnapshot = MmsAutoSendController.snapshot(this)
+        if (queueSnapshot == null) {
+            actionInProgress = false
+            return
+        }
+
         val sendButton = rootInActiveWindow?.let(::findSendButton)
         if (sendButton == null) {
             findAttempts++
             if (findAttempts < MAX_BUTTON_FIND_ATTEMPTS) {
+                SendProgressTracker.update(
+                    context = this,
+                    messageType = MessageType.MMS,
+                    totalRecipients = queueSnapshot.totalRecipients,
+                    completedRecipients = queueSnapshot.currentIndex,
+                    successfulRecipients = queueSnapshot.currentIndex,
+                    currentRecipient = queueSnapshot.currentRecipient,
+                    statusText = "Waiting for Google Messages send button for recipient ${queueSnapshot.currentIndex + 1} of ${queueSnapshot.totalRecipients}."
+                )
                 handler.postDelayed({ clickCurrentSendButton() }, BUTTON_RETRY_DELAY_MS)
             } else {
                 Log.e(TAG, "Verified send button not found after $findAttempts attempts")
+                SendProgressTracker.fail(
+                    context = this,
+                    messageType = MessageType.MMS,
+                    totalRecipients = queueSnapshot.totalRecipients,
+                    completedRecipients = queueSnapshot.currentIndex,
+                    successfulRecipients = queueSnapshot.currentIndex,
+                    currentRecipient = queueSnapshot.currentRecipient,
+                    statusText = "Could not find the send button for recipient ${queueSnapshot.currentIndex + 1}."
+                )
                 MmsAutoSendController.clear(this)
                 actionInProgress = false
             }
             return
         }
+
+        SendProgressTracker.update(
+            context = this,
+            messageType = MessageType.MMS,
+            totalRecipients = queueSnapshot.totalRecipients,
+            completedRecipients = queueSnapshot.currentIndex,
+            successfulRecipients = queueSnapshot.currentIndex,
+            currentRecipient = queueSnapshot.currentRecipient,
+            statusText = "Sending recipient ${queueSnapshot.currentIndex + 1} of ${queueSnapshot.totalRecipients}."
+        )
 
         val clicked = sendButton.performAction(AccessibilityNodeInfo.ACTION_CLICK)
         Log.i(
@@ -193,17 +280,45 @@ class GoogleMessagesAutoSendService : AccessibilityService() {
             if (findAttempts < MAX_BUTTON_FIND_ATTEMPTS) {
                 handler.postDelayed({ clickCurrentSendButton() }, BUTTON_RETRY_DELAY_MS)
             } else {
+                SendProgressTracker.fail(
+                    context = this,
+                    messageType = MessageType.MMS,
+                    totalRecipients = queueSnapshot.totalRecipients,
+                    completedRecipients = queueSnapshot.currentIndex,
+                    successfulRecipients = queueSnapshot.currentIndex,
+                    currentRecipient = queueSnapshot.currentRecipient,
+                    statusText = "Google Messages did not accept the send tap for recipient ${queueSnapshot.currentIndex + 1}."
+                )
                 MmsAutoSendController.clear(this)
                 actionInProgress = false
             }
             return
         }
 
+        val processedRecipients = queueSnapshot.currentIndex + 1
         if (!MmsAutoSendController.advance(this)) {
+            SendProgressTracker.complete(
+                context = this,
+                messageType = MessageType.MMS,
+                totalRecipients = queueSnapshot.totalRecipients,
+                completedRecipients = processedRecipients,
+                successfulRecipients = processedRecipients,
+                currentRecipient = queueSnapshot.currentRecipient,
+                statusText = "Finished MMS queue: $processedRecipients/${queueSnapshot.totalRecipients} recipients processed."
+            )
             actionInProgress = false
             return
         }
 
+        SendProgressTracker.update(
+            context = this,
+            messageType = MessageType.MMS,
+            totalRecipients = queueSnapshot.totalRecipients,
+            completedRecipients = processedRecipients,
+            successfulRecipients = processedRecipients,
+            currentRecipient = queueSnapshot.currentRecipient,
+            statusText = "Processed recipient $processedRecipients/${queueSnapshot.totalRecipients}. Opening the next conversation."
+        )
         handler.postDelayed({
             if (!MmsAutoSendController.launchCurrentRecipient(this)) {
                 Log.e(TAG, "Failed to launch the next MMS recipient")

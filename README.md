@@ -6,6 +6,7 @@ Signalist SMS is a Jetpack Compose Android app for sending messages to many reci
 
 - Loads contacts and contact groups from the device address book.
 - Lets you filter recipients by group and select multiple contacts at once.
+- Shows batch-level progress while SMS, LMS, or MMS sends are running.
 - Classifies text-only drafts as:
   - `SMS` when the draft fits in one SMS part.
   - `LMS` when the draft spans multiple SMS parts.
