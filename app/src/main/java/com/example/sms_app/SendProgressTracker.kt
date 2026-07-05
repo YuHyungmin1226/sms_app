@@ -2,6 +2,7 @@ package com.example.sms_app
 
 import android.content.Context
 import android.content.SharedPreferences
+import androidx.core.content.edit
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -145,7 +146,9 @@ object SendProgressTracker {
     }
 
     fun clear(context: Context) {
-        prefs(context).edit().clear().apply()
+        prefs(context).edit {
+            clear()
+        }
         _state.value = null
     }
 
@@ -160,16 +163,16 @@ object SendProgressTracker {
         isActive: Boolean,
         isError: Boolean
     ) {
-        prefs(context).edit()
-            .putString(KEY_MESSAGE_TYPE, messageType.name)
-            .putInt(KEY_TOTAL_RECIPIENTS, totalRecipients)
-            .putInt(KEY_COMPLETED_RECIPIENTS, completedRecipients.coerceAtMost(totalRecipients))
-            .putInt(KEY_SUCCESSFUL_RECIPIENTS, successfulRecipients.coerceAtMost(totalRecipients))
-            .putString(KEY_CURRENT_RECIPIENT, currentRecipient)
-            .putString(KEY_STATUS_TEXT, statusText)
-            .putBoolean(KEY_IS_ACTIVE, isActive)
-            .putBoolean(KEY_IS_ERROR, isError)
-            .apply()
+        prefs(context).edit {
+            putString(KEY_MESSAGE_TYPE, messageType.name)
+            putInt(KEY_TOTAL_RECIPIENTS, totalRecipients)
+            putInt(KEY_COMPLETED_RECIPIENTS, completedRecipients.coerceAtMost(totalRecipients))
+            putInt(KEY_SUCCESSFUL_RECIPIENTS, successfulRecipients.coerceAtMost(totalRecipients))
+            putString(KEY_CURRENT_RECIPIENT, currentRecipient)
+            putString(KEY_STATUS_TEXT, statusText)
+            putBoolean(KEY_IS_ACTIVE, isActive)
+            putBoolean(KEY_IS_ERROR, isError)
+        }
         refresh(context)
     }
 

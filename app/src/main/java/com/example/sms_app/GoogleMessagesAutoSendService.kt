@@ -10,6 +10,7 @@ import android.os.Looper
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import androidx.core.content.edit
 import org.json.JSONArray
 
 private const val GOOGLE_MESSAGES_PACKAGE = "com.google.android.apps.messaging"
@@ -49,15 +50,14 @@ object MmsAutoSendController {
         val recipientJson = JSONArray().apply {
             sanitizedRecipients.forEach(::put)
         }
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .edit()
-            .putString(KEY_RECIPIENTS, recipientJson.toString())
-            .putString(KEY_MESSAGE, message)
-            .putString(KEY_ATTACHMENT_URI, attachmentUri.toString())
-            .putString(KEY_MIME_TYPE, mimeType)
-            .putInt(KEY_CURRENT_INDEX, 0)
-            .putLong(KEY_ARMED_UNTIL, System.currentTimeMillis() + AUTO_SEND_TIMEOUT_MS)
-            .apply()
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit {
+            putString(KEY_RECIPIENTS, recipientJson.toString())
+            putString(KEY_MESSAGE, message)
+            putString(KEY_ATTACHMENT_URI, attachmentUri.toString())
+            putString(KEY_MIME_TYPE, mimeType)
+            putInt(KEY_CURRENT_INDEX, 0)
+            putLong(KEY_ARMED_UNTIL, System.currentTimeMillis() + AUTO_SEND_TIMEOUT_MS)
+        }
 
         SendProgressTracker.start(
             context = context,
@@ -92,7 +92,9 @@ object MmsAutoSendController {
             clear(context)
             return false
         }
-        prefs.edit().putInt(KEY_CURRENT_INDEX, nextIndex).apply()
+        prefs.edit {
+            putInt(KEY_CURRENT_INDEX, nextIndex)
+        }
         return true
     }
 
@@ -171,7 +173,9 @@ object MmsAutoSendController {
                     context.revokeUriPermission(attachmentUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 }
             }
-        prefs.edit().clear().apply()
+        prefs.edit {
+            clear()
+        }
     }
 
     private fun currentRecipient(context: Context): String? {
